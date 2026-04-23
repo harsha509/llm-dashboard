@@ -1,0 +1,23 @@
+# Compiled binary (built with `go build`)
+/llm-dashboard
+
+# Cross-compiled builds
+/llm-dashboard-*
+
+# Runtime SQLite database + WAL sidecars (see db.go: journal_mode=WAL)
+/llm-dashboard.db
+/llm-dashboard.db-wal
+/llm-dashboard.db-shm
+
+# macOS Finder metadata
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Go test / coverage artifacts
+*.test
+*.out
+coverage.*

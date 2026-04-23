@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -107,6 +109,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rec := &Record{
 		Timestamp: t0,
+		SessionID: sessionIDFromRequest(r.URL.Path, reqMeta.Model, reqBody),
 		Task:      summarize(reqMeta.Prompt, 120),
 		Model:     reqMeta.Model,
 		Status:    resp.StatusCode,
@@ -313,6 +316,60 @@ func isGeneration(p string) bool {
 	return strings.HasSuffix(p, "/v1/chat/completions") ||
 		strings.HasSuffix(p, "/v1/completions") ||
 		strings.HasSuffix(p, "/completion") // llama.cpp native
+}
+
+// sessionIDFromRequest returns a stable session id for a chat-style request by
+// hashing (model + first user message content). Every follow-up turn in the
+// same conversation re-sends messages[0] unchanged, so the hash stays constant
+// across the session. Returns "" for non-chat endpoints (where we have no
+// stable anchor).
+//
+// Collisions: two genuinely different conversations that both start with the
+// same first user message on the same model will share an id. Acceptable for
+// a local dev tool — and if it matters later, pairing on (model, first
+// message, approximate start time) narrows it further.
+func sessionIDFromRequest(path, model string, body []byte) string {
+	if !strings.HasSuffix(path, "/v1/chat/completions") {
+		return ""
+	}
+	var v struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"` // can be string or array of parts
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return ""
+	}
+	var firstUser string
+	for _, m := range v.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		switch c := m.Content.(type) {
+		case string:
+			firstUser = c
+		case []any:
+			// Multi-modal content: concatenate any text parts.
+			var parts []string
+			for _, p := range c {
+				if pm, ok := p.(map[string]any); ok {
+					if t, ok := pm["text"].(string); ok {
+						parts = append(parts, t)
+					}
+				}
+			}
+			firstUser = strings.Join(parts, "")
+		}
+		if firstUser != "" {
+			break
+		}
+	}
+	if firstUser == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(model + "\x00" + firstUser))
+	return hex.EncodeToString(h[:8]) // 16 hex chars — plenty for local use
 }
 
 func copyHeader(dst, src http.Header) {

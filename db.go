@@ -14,6 +14,7 @@ import (
 type Record struct {
 	ID               int64             `json:"id"`
 	Timestamp        time.Time         `json:"ts"`
+	SessionID        string            `json:"session_id"`         // derived from first user message + model; stable across turns
 	Task             string            `json:"task"`               // first ~120 chars of the prompt
 	Model            string            `json:"model"`
 	PromptTokens     int               `json:"prompt_tokens"`
@@ -63,6 +64,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS records(
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ts INTEGER NOT NULL,
+			session_id TEXT,
 			task TEXT,
 			model TEXT,
 			prompt_tokens INTEGER,
@@ -93,7 +95,33 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+
+	// session_id was added in a later revision — add it to existing DBs.
+	if err := s.addColumnIfMissing("records", "session_id", "TEXT"); err != nil {
+		return fmt.Errorf("migrate session_id: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id)`); err != nil {
+		return fmt.Errorf("migrate session index: %w", err)
+	}
 	return nil
+}
+
+// addColumnIfMissing runs ALTER TABLE ADD COLUMN only if the column is absent.
+// Uses pragma_table_info so it's safe to call on fresh and upgraded DBs.
+func (s *Store) addColumnIfMissing(table, column, decl string) error {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`,
+		table, column,
+	).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl))
+	return err
 }
 
 func (s *Store) GetConfig(key string) (string, error) {
@@ -146,9 +174,9 @@ func (s *Store) InsertRecord(r *Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	temps, _ := json.Marshal(r.GPUTemps)
-	res, err := s.db.Exec(`INSERT INTO records(ts,task,model,prompt_tokens,completion_tokens,total_ms,prefill_ms,decode_ms,tokens_per_second,gpu_temps,status)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		r.Timestamp.UnixMilli(), r.Task, r.Model, r.PromptTokens, r.CompletionTokens,
+	res, err := s.db.Exec(`INSERT INTO records(ts,session_id,task,model,prompt_tokens,completion_tokens,total_ms,prefill_ms,decode_ms,tokens_per_second,gpu_temps,status)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.Timestamp.UnixMilli(), r.SessionID, r.Task, r.Model, r.PromptTokens, r.CompletionTokens,
 		r.TotalMS, r.PrefillMS, r.DecodeMS, r.TokensPerSecond, string(temps), r.Status)
 	if err != nil {
 		return err
@@ -161,7 +189,7 @@ func (s *Store) RecentRecords(limit int) ([]Record, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`SELECT id,ts,task,model,prompt_tokens,completion_tokens,total_ms,prefill_ms,decode_ms,tokens_per_second,gpu_temps,status
+	rows, err := s.db.Query(`SELECT id,ts,COALESCE(session_id,''),task,model,prompt_tokens,completion_tokens,total_ms,prefill_ms,decode_ms,tokens_per_second,gpu_temps,status
 		FROM records ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -172,7 +200,7 @@ func (s *Store) RecentRecords(limit int) ([]Record, error) {
 		var r Record
 		var tsMs int64
 		var temps string
-		if err := rows.Scan(&r.ID, &tsMs, &r.Task, &r.Model, &r.PromptTokens, &r.CompletionTokens,
+		if err := rows.Scan(&r.ID, &tsMs, &r.SessionID, &r.Task, &r.Model, &r.PromptTokens, &r.CompletionTokens,
 			&r.TotalMS, &r.PrefillMS, &r.DecodeMS, &r.TokensPerSecond, &temps, &r.Status); err != nil {
 			return nil, err
 		}

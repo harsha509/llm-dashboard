@@ -10,7 +10,7 @@ GPU temperature so each row shows the peak GPU temp seen during that request.
 
 - **No instrumentation needed in your LLM server** — just re-point clients at the proxy.
 - **Single Go binary, pure-Go SQLite** — no CGO, drop it anywhere.
-- **Table UI** with live averages footer at `http://localhost:7000`.
+- **Table UI** with live averages footer at `http://localhost:7002`.
 
 ---
 
@@ -26,19 +26,19 @@ That's it. One static binary.
 
 ```bash
 ./llm-dashboard
-# dashboard  -> http://localhost:7000
-# llm proxy -> http://localhost:7001
+# dashboard  -> http://localhost:7002
+# llm proxy  -> http://localhost:7001
 ```
 
 Flags:
 
-- `-ui :7000`     dashboard HTTP listener
+- `-ui :7002`     dashboard HTTP listener
 - `-proxy :7001`  the reverse-proxy your clients should talk to
 - `-db ./llm-dashboard.db` SQLite path
 
 ## First-time setup
 
-1. Open `http://localhost:7000` in a browser.
+1. Open `http://localhost:7002` in a browser.
 2. Click **Settings**.
 3. Set **Upstream LLM URL** to where your vLLM (or OpenAI-compatible) server is actually listening, e.g. `http://localhost:8000`.
 4. Add each DGX Spark node (name, host, user, port, GPU index).
@@ -67,6 +67,7 @@ Every request flows through transparently and shows up in the dashboard within ~
 
 | column | source |
 | --- | --- |
+| session_id | SHA-256 of `model + first user message`, truncated to 16 hex chars; shared by all turns of the same chat. Only populated for `/v1/chat/completions`. |
 | task | first ~120 chars of the last user message / prompt |
 | model | request's `model` field or response's `model` |
 | t/s | `completion_tokens / decode_time` (falls back to wall-clock) |
@@ -102,7 +103,13 @@ Notes:
 `./llm-dashboard.db` (SQLite) contains three tables: `records`, `sparks`, `config`. Back it up, grep it, import it to pandas — it's just SQLite.
 
 ```bash
-sqlite3 llm-dashboard.db 'SELECT ts, model, tokens_per_second, gpu_temps FROM records ORDER BY id DESC LIMIT 20'
+sqlite3 llm-dashboard.db 'SELECT ts, session_id, model, tokens_per_second, gpu_temps FROM records ORDER BY id DESC LIMIT 20'
+```
+
+Group a conversation's turns together:
+
+```bash
+sqlite3 llm-dashboard.db "SELECT session_id, COUNT(*) turns, AVG(tokens_per_second) avg_tps FROM records WHERE session_id != '' GROUP BY session_id ORDER BY turns DESC"
 ```
 
 ## Troubleshooting
