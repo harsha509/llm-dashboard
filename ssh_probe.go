@@ -15,8 +15,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Probe samples GPU temperatures from each configured Spark during the window
-// of an LLM request. One Probe is shared by the whole app.
+// Probe samples GPU temperatures from each configured Spark via SSH. One
+// Probe is shared by the whole app; the scraper calls ReadAll() once per tick.
 type Probe struct {
 	store *Store
 
@@ -33,107 +33,90 @@ func NewProbe(store *Store) *Probe {
 	return &Probe{store: store, clients: map[string]*sshClient{}}
 }
 
-// Sample returns the peak GPU temperature seen on each configured Spark between
-// now and when stop() is called (or ctx expires). Call Sample() right before
-// the upstream request and call the returned stop func when the response ends.
-//
-// The returned map has one entry per Spark; missing entries mean the probe
-// could not reach that node and the dashboard will render "--".
-func (p *Probe) Sample(ctx context.Context) (stop func() map[string]float64) {
+// ReadAll takes one temperature reading from every configured Spark in
+// parallel and returns a map keyed by Spark.Name. Sparks we can't reach
+// are omitted from the result; the reason is logged once per tick so an
+// empty tile on the dashboard has a corresponding line in the terminal.
+func (p *Probe) ReadAll(ctx context.Context) map[string]float64 {
 	sparks, err := p.store.ListSparks()
 	if err != nil {
 		log.Printf("probe: list sparks: %v", err)
-		return func() map[string]float64 { return nil }
+		return nil
 	}
 	if len(sparks) == 0 {
-		return func() map[string]float64 { return nil }
+		return nil
 	}
-
-	peaks := make(map[string]float64, len(sparks))
+	out := make(map[string]float64, len(sparks))
 	var mu sync.Mutex
-	done := make(chan struct{})
-
 	var wg sync.WaitGroup
 	for _, sp := range sparks {
 		wg.Add(1)
 		go func(sp Spark) {
 			defer wg.Done()
-			tick := time.NewTicker(500 * time.Millisecond)
-			defer tick.Stop()
-
-			// Take an immediate reading so even short requests capture a value.
-			if t, ok := p.readOnce(sp); ok {
-				mu.Lock()
-				if t > peaks[sp.Name] {
-					peaks[sp.Name] = t
-				}
-				mu.Unlock()
+			// readOnce ignores ctx; this gives us a ceiling anyway.
+			done := make(chan struct{})
+			var t float64
+			var readErr error
+			go func() {
+				t, readErr = p.readOnce(sp)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				log.Printf("probe: %s: cancelled before response", sp.Name)
+				return
 			}
-
-			for {
-				select {
-				case <-done:
-					return
-				case <-ctx.Done():
-					return
-				case <-tick.C:
-					if t, ok := p.readOnce(sp); ok {
-						mu.Lock()
-						if t > peaks[sp.Name] {
-							peaks[sp.Name] = t
-						}
-						mu.Unlock()
-					}
-				}
+			if readErr != nil {
+				log.Printf("probe: %s (%s@%s:%d gpu=%d): %v",
+					sp.Name, sp.User, sp.Host, sp.Port, sp.GPUIndex, readErr)
+				return
 			}
+			mu.Lock()
+			out[sp.Name] = t
+			mu.Unlock()
 		}(sp)
 	}
-
-	return func() map[string]float64 {
-		close(done)
-		wg.Wait()
-		mu.Lock()
-		defer mu.Unlock()
-		out := make(map[string]float64, len(peaks))
-		for k, v := range peaks {
-			out[k] = v
-		}
-		return out
-	}
+	wg.Wait()
+	return out
 }
 
 // readOnce runs `nvidia-smi --query-gpu=temperature.gpu -i <idx> --format=csv,noheader,nounits`
-// and returns the parsed integer temperature.
-func (p *Probe) readOnce(sp Spark) (float64, bool) {
+// on the target spark over SSH. Returns the parsed temperature or the
+// underlying error (dial/auth/exec/parse) so callers can surface it.
+func (p *Probe) readOnce(sp Spark) (float64, error) {
 	cli, err := p.clientFor(sp)
 	if err != nil {
-		// Log at debug volume — SSH failures are common (key missing, node down)
-		// and we don't want to spam the log on every tick.
-		return 0, false
+		return 0, fmt.Errorf("ssh dial: %w", err)
 	}
 	sess, err := cli.NewSession()
 	if err != nil {
 		// Connection probably went stale — drop it so next call reconnects.
 		p.drop(sp.Name)
-		return 0, false
+		return 0, fmt.Errorf("ssh new session (will reconnect next tick): %w", err)
 	}
 	defer sess.Close()
 
 	cmd := fmt.Sprintf("nvidia-smi --query-gpu=temperature.gpu -i %d --format=csv,noheader,nounits", sp.GPUIndex)
-	var out bytes.Buffer
+	var out, errBuf bytes.Buffer
 	sess.Stdout = &out
+	sess.Stderr = &errBuf
 	if err := sess.Run(cmd); err != nil {
-		return 0, false
+		stderr := strings.TrimSpace(errBuf.String())
+		if stderr != "" {
+			return 0, fmt.Errorf("%s: %v (stderr: %s)", cmd, err, stderr)
+		}
+		return 0, fmt.Errorf("%s: %w", cmd, err)
 	}
 	s := strings.TrimSpace(out.String())
 	if s == "" {
-		return 0, false
+		return 0, fmt.Errorf("%s returned empty output", cmd)
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, false
+		return 0, fmt.Errorf("parse %q: %w", s, err)
 	}
-	return v, true
+	return v, nil
 }
 
 func (p *Probe) clientFor(sp Spark) (*ssh.Client, error) {

@@ -37,6 +37,30 @@ type Spark struct {
 	GPUIndex int    `json:"gpu_index"`
 }
 
+// Sample is one periodic scrape of the upstream vLLM /metrics endpoint,
+// plus GPU temps from each configured Spark at that same tick. Rates
+// (tokens/sec, queue deltas) are computed on the frontend from consecutive
+// samples, so we store raw counters here.
+type Sample struct {
+	ID                    int64              `json:"id"`
+	Timestamp             time.Time          `json:"ts"`
+	Upstream              string             `json:"upstream"`                // scrape target, for when we scrape multiple
+	Model                 string             `json:"model"`                   // served model name, from the model_name="..." label on vllm:* metrics
+	PromptTokensTotal     int64              `json:"prompt_tokens_total"`     // vllm:prompt_tokens_total (counter)
+	GenerationTokensTotal int64              `json:"generation_tokens_total"` // vllm:generation_tokens_total (counter)
+	NumRequestsRunning    float64            `json:"num_requests_running"`    // vllm:num_requests_running (gauge)
+	NumRequestsWaiting    float64            `json:"num_requests_waiting"`    // vllm:num_requests_waiting (gauge)
+	GPUCacheUsagePerc     float64            `json:"gpu_cache_usage_perc"`    // vllm:gpu_cache_usage_perc (gauge, 0..1)
+	TTFTSum               float64            `json:"ttft_sum"`                // vllm:time_to_first_token_seconds_sum
+	TTFTCount             int64              `json:"ttft_count"`              // vllm:time_to_first_token_seconds_count
+	TPOTSum               float64            `json:"tpot_sum"`                // vllm:time_per_output_token_seconds_sum
+	TPOTCount             int64              `json:"tpot_count"`              // vllm:time_per_output_token_seconds_count
+	E2ESum                float64            `json:"e2e_sum"`                 // vllm:e2e_request_latency_seconds_sum
+	E2ECount              int64              `json:"e2e_count"`               // vllm:e2e_request_latency_seconds_count
+	GPUTemps              map[string]float64 `json:"gpu_temps"`               // spark name -> °C at this tick
+	ScrapeError           string             `json:"scrape_error"`            // non-empty if /metrics fetch or parse failed
+}
+
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex
@@ -89,6 +113,29 @@ func (s *Store) migrate() error {
 			key TEXT PRIMARY KEY,
 			value TEXT
 		)`,
+		// samples is the time-series table for periodic /metrics scrapes.
+		// One row per scrape tick (every few seconds). We store raw counter
+		// and gauge values; the UI computes rates from consecutive rows.
+		`CREATE TABLE IF NOT EXISTS samples(
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts INTEGER NOT NULL,
+			upstream TEXT,
+			model TEXT,
+			prompt_tokens_total INTEGER,
+			generation_tokens_total INTEGER,
+			num_requests_running REAL,
+			num_requests_waiting REAL,
+			gpu_cache_usage_perc REAL,
+			ttft_sum REAL,
+			ttft_count INTEGER,
+			tpot_sum REAL,
+			tpot_count INTEGER,
+			e2e_sum REAL,
+			e2e_count INTEGER,
+			gpu_temps TEXT,
+			scrape_error TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts DESC)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -102,6 +149,10 @@ func (s *Store) migrate() error {
 	}
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id)`); err != nil {
 		return fmt.Errorf("migrate session index: %w", err)
+	}
+	// model column on samples — added after the initial samples table landed.
+	if err := s.addColumnIfMissing("samples", "model", "TEXT"); err != nil {
+		return fmt.Errorf("migrate samples.model: %w", err)
 	}
 	return nil
 }
@@ -183,6 +234,88 @@ func (s *Store) InsertRecord(r *Record) error {
 	}
 	r.ID, _ = res.LastInsertId()
 	return nil
+}
+
+// ClearSamples wipes the samples time-series AND the legacy records table
+// (kept from the old proxy era). Called by the "Clear history" button in
+// Settings.
+func (s *Store) ClearSamples() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(`DELETE FROM samples`); err != nil {
+		return err
+	}
+	// Old table from the proxy era; still worth clearing so "clear history"
+	// actually means "fresh slate" even if someone reads the DB directly.
+	if _, err := s.db.Exec(`DELETE FROM records`); err != nil {
+		return err
+	}
+	// Reclaim space. VACUUM is a light operation on a small file.
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) InsertSample(r *Sample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	temps, _ := json.Marshal(r.GPUTemps)
+	res, err := s.db.Exec(`INSERT INTO samples(
+		ts, upstream, model,
+		prompt_tokens_total, generation_tokens_total,
+		num_requests_running, num_requests_waiting, gpu_cache_usage_perc,
+		ttft_sum, ttft_count, tpot_sum, tpot_count, e2e_sum, e2e_count,
+		gpu_temps, scrape_error
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.Timestamp.UnixMilli(), r.Upstream, r.Model,
+		r.PromptTokensTotal, r.GenerationTokensTotal,
+		r.NumRequestsRunning, r.NumRequestsWaiting, r.GPUCacheUsagePerc,
+		r.TTFTSum, r.TTFTCount, r.TPOTSum, r.TPOTCount, r.E2ESum, r.E2ECount,
+		string(temps), r.ScrapeError)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = res.LastInsertId()
+	return nil
+}
+
+func (s *Store) RecentSamples(limit int) ([]Sample, error) {
+	if limit <= 0 {
+		limit = 300
+	}
+	rows, err := s.db.Query(`SELECT id, ts, COALESCE(upstream,''), COALESCE(model,''),
+		COALESCE(prompt_tokens_total,0), COALESCE(generation_tokens_total,0),
+		COALESCE(num_requests_running,0), COALESCE(num_requests_waiting,0),
+		COALESCE(gpu_cache_usage_perc,0),
+		COALESCE(ttft_sum,0), COALESCE(ttft_count,0),
+		COALESCE(tpot_sum,0), COALESCE(tpot_count,0),
+		COALESCE(e2e_sum,0), COALESCE(e2e_count,0),
+		COALESCE(gpu_temps,''), COALESCE(scrape_error,'')
+		FROM samples ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Sample
+	for rows.Next() {
+		var r Sample
+		var tsMs int64
+		var temps string
+		if err := rows.Scan(&r.ID, &tsMs, &r.Upstream, &r.Model,
+			&r.PromptTokensTotal, &r.GenerationTokensTotal,
+			&r.NumRequestsRunning, &r.NumRequestsWaiting, &r.GPUCacheUsagePerc,
+			&r.TTFTSum, &r.TTFTCount, &r.TPOTSum, &r.TPOTCount, &r.E2ESum, &r.E2ECount,
+			&temps, &r.ScrapeError); err != nil {
+			return nil, err
+		}
+		r.Timestamp = time.UnixMilli(tsMs)
+		if temps != "" {
+			_ = json.Unmarshal([]byte(temps), &r.GPUTemps)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) RecentRecords(limit int) ([]Record, error) {

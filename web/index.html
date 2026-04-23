@@ -47,35 +47,74 @@
     text-align: center; color: var(--muted); padding: 60px 20px;
   }
 
-  table { width: 100%; border-collapse: collapse; }
+  /* tile grid — auto-fill (not auto-fit) so trailing tiles on a wrapped row
+     stay their natural width instead of stretching to fill the extra space. */
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 200px));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .tile .label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+  .tile .value {
+    font-size: 22px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .tile .unit {
+    font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 4px;
+  }
+  .tile .sub {
+    font-size: 11px; color: var(--muted); margin-top: 4px;
+  }
+
+  .section-header {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    margin: 20px 0 8px;
+  }
+
+  /* Recent-scrapes table. Fixed layout + per-column widths keeps the
+     numeric columns from stretching when a row has a large value. */
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
   thead th {
     position: sticky; top: 49px; z-index: 5;
     background: var(--panel);
-    text-align: left; padding: 8px 10px;
+    text-align: right; padding: 8px 10px;
     border-bottom: 1px solid var(--border);
     font-weight: 600; font-size: 12px; color: var(--muted);
     text-transform: uppercase; letter-spacing: 0.04em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  thead th:first-child { text-align: left; }
   tbody td {
     padding: 7px 10px;
     border-bottom: 1px solid rgba(48,54,61,0.4);
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis;
   }
   tbody tr:hover { background: rgba(88,166,255,0.06); }
-  td.task { white-space: normal; min-width: 200px; max-width: 340px; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  tfoot td {
-    padding: 10px; font-weight: 700;
-    background: var(--panel);
-    border-top: 2px solid var(--border);
-    position: sticky; bottom: 0;
-  }
-  tfoot td.label { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 12px; }
+  td.num { text-align: right; }
+  /* Per-column widths. First column (timestamp) is narrow and left-aligned;
+     the rest are right-aligned numeric columns of similar size. */
+  #samplesTable th:nth-child(1), #samplesTable td:nth-child(1) { width: 90px; }
+  #samplesTable th:nth-child(n+2), #samplesTable td:nth-child(n+2) { width: 95px; }
 
   .temp-cool { color: var(--cool); }
   .temp-warm { color: var(--warm); }
   .temp-hot  { color: var(--hot); font-weight: 700; }
   .muted { color: var(--muted); }
+  .error { color: var(--hot); }
 
   /* modal */
   .modal-bg {
@@ -107,41 +146,42 @@
   <h1>LLM Dashboard</h1>
   <span class="status" id="status">—</span>
   <div class="right">
-    <span class="muted" id="proxyHint"></span>
+    <span class="muted" id="scrapeAge"></span>
     <button id="settingsBtn">Settings</button>
   </div>
 </header>
 
-<div class="wrap">
-  <div id="empty" class="empty">
-    No requests recorded yet. Point your LLM clients at the proxy (see Settings) and start generating.
-  </div>
-  <table id="tbl" style="display:none">
+<div class="wrap" id="wrap">
+  <div id="tiles" class="tiles"></div>
+
+  <div class="section-header">Recent scrapes</div>
+  <table id="samplesTable">
     <thead>
-      <tr id="thead-row">
+      <tr>
         <th>When</th>
-        <th>Task</th>
-        <th>Model</th>
-        <th class="num">t/s</th>
-        <th class="num">Prompt</th>
-        <th class="num">Out</th>
-        <th class="num">Prefill</th>
-        <th class="num">Total</th>
-        <!-- GPU temp columns injected dynamically -->
+        <th class="num">Prompt t/s</th>
+        <th class="num">Gen t/s</th>
+        <th class="num">Running</th>
+        <th class="num">Waiting</th>
+        <th class="num">KV %</th>
+        <th class="num">TTFT (ms)</th>
+        <th class="num">TPOT (ms)</th>
+        <!-- per-spark °C columns are appended here by ensureHeaderHasSparks() -->
       </tr>
     </thead>
-    <tbody id="tbody"></tbody>
-    <tfoot id="tfoot"></tfoot>
+    <tbody id="samplesBody"></tbody>
   </table>
+  <div id="empty" class="empty" style="display:none">
+    No scrapes yet. Set the upstream URL in Settings — it should point at your vLLM server (e.g. <code>http://spark1.local:8000</code>).
+  </div>
 </div>
 
 <div class="modal-bg" id="modalBg">
   <div class="modal">
     <h2>Settings</h2>
-    <label>Upstream LLM URL (e.g. your vLLM / LM Studio / llama.cpp server)</label>
-    <input id="upstreamUrl" placeholder="http://localhost:8000" />
-    <div class="hint">Point your LLM clients at <b><span id="proxyAddrHint"></span></b> instead of the upstream.
-      The proxy transparently forwards requests and records metrics.</div>
+    <label>Upstream vLLM URL (the dashboard scrapes <code>/metrics</code> on this host)</label>
+    <input id="upstreamUrl" placeholder="http://spark1.local:8000" />
+    <div class="hint">The dashboard polls <code>&lt;upstream&gt;/metrics</code> every few seconds. Your clients should continue to talk to this URL directly — there is no proxy.</div>
 
     <label style="margin-top:18px">DGX Spark nodes (SSH target for nvidia-smi)</label>
     <div class="spark-row muted" style="font-size:11px">
@@ -156,19 +196,28 @@
       <input id="newGPU" placeholder="0" type="number" />
       <button id="addSparkBtn">+</button>
     </div>
-    <div class="hint">Uses <code>~/.ssh/id_ed25519</code> or <code>id_rsa</code> by default. Key-based auth only.</div>
+    <div class="hint">Click <b>+</b> to stage another row before filling it in. Any values in the last row will also be saved. Uses <code>~/.ssh/id_ed25519</code> or <code>id_rsa</code> by default. Key-based auth only.</div>
 
-    <div class="actions">
-      <button id="cancelBtn">Cancel</button>
-      <button id="saveBtn" class="primary">Save</button>
+    <div class="actions" style="justify-content: space-between">
+      <button id="clearBtn" class="danger" title="Delete all recorded scrape samples from the SQLite store. Does not affect upstream or spark settings.">Clear scrape history</button>
+      <div style="display:flex; gap:8px">
+        <button id="cancelBtn">Cancel</button>
+        <button id="saveBtn" class="primary">Save</button>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let SPARKS = [];   // list of known sparks (from last /api/config)
+
+// SPARKS is the poll-driven, server-truth copy used by the main view.
+// EDIT_SPARKS is the modal's detached working copy — nothing in the polling
+// loop touches it, so in-progress edits can't be wiped by a refresh tick.
+let SPARKS = [];
+let EDIT_SPARKS = [];
 let UPSTREAM = "";
+let SAMPLES = []; // newest first
 
 function tempClass(t) {
   if (t == null || isNaN(t)) return '';
@@ -176,117 +225,256 @@ function tempClass(t) {
   if (t >= 70) return 'temp-warm';
   return 'temp-cool';
 }
-
-function fmtTime(ms) {
-  const d = new Date(ms);
-  const pad = n => String(n).padStart(2, '0');
+function escape(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmt(n, digits) {
+  if (n == null || isNaN(n) || !isFinite(n)) return '—';
+  return (typeof digits === 'number') ? n.toFixed(digits) : String(n);
+}
+function ageShort(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s%60}s ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m%60}m ago`;
+}
+function hhmmss(tsMs) {
+  const d = new Date(tsMs);
+  const pad = n => n < 10 ? '0'+n : ''+n;
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function renderThead() {
-  const row = $('thead-row');
-  // Drop any previously injected temp columns
-  [...row.querySelectorAll('.temp-col')].forEach(n => n.remove());
-  for (const sp of SPARKS) {
-    const th = document.createElement('th');
-    th.className = 'num temp-col';
-    th.textContent = `°C ${sp.name}`;
-    row.appendChild(th);
-  }
+// --- derived rates ------------------------------------------------------
+
+// SAMPLES are newest-first. ratePair(latest, older) returns per-second rate
+// of counter delta, guarding against counter resets (vLLM restart).
+function rate(latest, older, key, seconds) {
+  if (!older) return null;
+  const d = latest[key] - older[key];
+  if (d < 0) return null; // counter reset — drop this sample rather than show negative
+  if (seconds <= 0) return null;
+  return d / seconds;
+}
+function avgDelta(latest, older, sumKey, countKey) {
+  if (!older) return null;
+  const ds = latest[sumKey] - older[sumKey];
+  const dc = latest[countKey] - older[countKey];
+  if (dc <= 0 || ds < 0) return null;
+  return ds / dc;
 }
 
-function renderRecords(recs) {
-  const tbody = $('tbody');
-  const tfoot = $('tfoot');
-  tbody.innerHTML = '';
-  tfoot.innerHTML = '';
+// latestAndBaseline picks the newest sample with no scrape_error and the
+// one roughly `windowSec` seconds older than it, so tiles reflect recent
+// traffic instead of the whole history since vLLM started.
+function latestAndBaseline(windowSec) {
+  const good = SAMPLES.filter(s => !s.scrape_error);
+  if (good.length === 0) return [null, null, 0];
+  const latest = good[0];
+  const targetMs = new Date(latest.ts).getTime() - windowSec * 1000;
+  let older = null;
+  for (let i = 1; i < good.length; i++) {
+    if (new Date(good[i].ts).getTime() <= targetMs) { older = good[i]; break; }
+  }
+  if (!older) older = good[good.length - 1];
+  const dt = (new Date(latest.ts).getTime() - new Date(older.ts).getTime()) / 1000;
+  return [latest, older, dt];
+}
 
-  if (!recs || recs.length === 0) {
-    $('tbl').style.display = 'none';
-    $('empty').style.display = 'block';
+// sessionRate averages a counter across the entire SAMPLES window (oldest
+// good sample → newest good sample). Useful because the short-window rate
+// drops to 0 between bursts — the session rate smooths over idle gaps.
+function sessionRate(key) {
+  const good = SAMPLES.filter(s => !s.scrape_error);
+  if (good.length < 2) return null;
+  const latest = good[0];
+  const oldest = good[good.length - 1];
+  const dt = (new Date(latest.ts).getTime() - new Date(oldest.ts).getTime()) / 1000;
+  if (dt <= 0) return null;
+  const d = latest[key] - oldest[key];
+  if (d < 0) return null; // counter reset (vLLM restart) — skip
+  return d / dt;
+}
+
+// --- tiles --------------------------------------------------------------
+
+function renderTiles() {
+  const tiles = $('tiles');
+  const [latest, older, dtSec] = latestAndBaseline(30);
+  if (!latest) {
+    tiles.innerHTML = '';
     return;
   }
-  $('tbl').style.display = '';
-  $('empty').style.display = 'none';
 
-  let sumTps = 0, nTps = 0;
-  const tempSums = {}, tempCounts = {};
-  for (const sp of SPARKS) { tempSums[sp.name] = 0; tempCounts[sp.name] = 0; }
+  const promptRate = rate(latest, older, 'prompt_tokens_total', dtSec);
+  const genRate    = rate(latest, older, 'generation_tokens_total', dtSec);
+  const ttftAvg    = avgDelta(latest, older, 'ttft_sum', 'ttft_count');
+  const tpotAvg    = avgDelta(latest, older, 'tpot_sum', 'tpot_count');
+  const e2eAvg     = avgDelta(latest, older, 'e2e_sum', 'e2e_count');
 
-  for (const r of recs) {
+  // Short-window rates for "right now" feel.
+  // Session-wide rates + cumulative totals for "am I actually seeing data"
+  // — these stay non-zero across idle gaps as long as any traffic has
+  // happened since the dashboard started polling.
+  const genSessionRate    = sessionRate('generation_tokens_total');
+  const promptSessionRate = sessionRate('prompt_tokens_total');
+
+  // Number formatter that keeps large counters readable: 12,345,678.
+  const bignum = (n) => (n == null || isNaN(n)) ? '—' : Math.round(n).toLocaleString();
+
+  const cards = [
+    // --- live / short-window view (last ~30s) --------------------------
+    { label: 'Prompt tok/s',  value: fmt(promptRate, 1), sub: 'last 30s' },
+    { label: 'Gen tok/s',     value: fmt(genRate, 1),    sub: 'last 30s' },
+    { label: 'Running',       value: fmt(latest.num_requests_running, 0) },
+    { label: 'Waiting',       value: fmt(latest.num_requests_waiting, 0) },
+    { label: 'KV cache',      value: fmt((latest.gpu_cache_usage_perc||0)*100, 1), unit: '%' },
+    { label: 'Avg TTFT',      value: fmt(ttftAvg != null ? ttftAvg*1000 : null, 0), unit: 'ms', sub: 'last 30s' },
+    { label: 'Avg TPOT',      value: fmt(tpotAvg != null ? tpotAvg*1000 : null, 1), unit: 'ms', sub: 'last 30s' },
+    { label: 'Avg e2e',       value: fmt(e2eAvg  != null ? e2eAvg*1000  : null, 0), unit: 'ms', sub: 'last 30s' },
+
+    // --- session totals (never go back to 0 once traffic has happened) -
+    { label: 'Session gen t/s',    value: fmt(genSessionRate, 2),    sub: 'since oldest sample' },
+    { label: 'Session prompt t/s', value: fmt(promptSessionRate, 2), sub: 'since oldest sample' },
+    { label: 'Total prompt tok',   value: bignum(latest.prompt_tokens_total) },
+    { label: 'Total gen tok',      value: bignum(latest.generation_tokens_total) },
+    { label: 'Total requests',     value: bignum(latest.e2e_count) },
+  ];
+
+  // Per-spark GPU temp tiles
+  for (const sp of SPARKS) {
+    const t = latest.gpu_temps ? latest.gpu_temps[sp.name] : null;
+    cards.push({
+      label: `${sp.name} °C`,
+      value: t != null ? fmt(t, 0) : '—',
+      valueClass: tempClass(t),
+    });
+  }
+
+  tiles.innerHTML = cards.map(c => `
+    <div class="tile">
+      <div class="label">${escape(c.label)}</div>
+      <div class="value ${c.valueClass||''}">${escape(c.value)}${c.unit ? `<span class="unit">${escape(c.unit)}</span>` : ''}</div>
+      ${c.sub ? `<div class="sub">${escape(c.sub)}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+// --- recent samples table ----------------------------------------------
+
+// Rebuild the thead's per-spark temperature columns. Idempotent: removes any
+// spark columns we previously added, then appends one per current spark.
+function ensureHeaderHasSparks() {
+  const tr = document.querySelector('#samplesTable thead tr');
+  tr.querySelectorAll('th.spark').forEach(el => el.remove());
+  for (const sp of SPARKS) {
+    const th = document.createElement('th');
+    th.className = 'num spark';
+    th.textContent = `°C ${sp.name}`;
+    tr.appendChild(th);
+  }
+}
+
+function renderSamples() {
+  ensureHeaderHasSparks();
+  const body = $('samplesBody');
+  body.innerHTML = '';
+  const latest = SAMPLES.length ? SAMPLES[0] : null;
+
+  // Iterate oldest→newest of the recent tail so each "rate" row compares
+  // against the immediately previous scrape. Show the most recent ~60.
+  const window = SAMPLES.slice(0, 60).reverse();
+  for (let i = 0; i < window.length; i++) {
+    const s = window[i];
+    const prev = i > 0 ? window[i - 1] : null;
+    const dt = prev ? (new Date(s.ts).getTime() - new Date(prev.ts).getTime()) / 1000 : null;
+    const pRate = prev && dt > 0 ? rate(s, prev, 'prompt_tokens_total', dt) : null;
+    const gRate = prev && dt > 0 ? rate(s, prev, 'generation_tokens_total', dt) : null;
+    const ttft  = prev ? avgDelta(s, prev, 'ttft_sum', 'ttft_count') : null;
+    const tpot  = prev ? avgDelta(s, prev, 'tpot_sum', 'tpot_count') : null;
+
     const tr = document.createElement('tr');
+    // If this row is a failed scrape, tag every cell with a title= tooltip
+    // containing the actual error message so hover reveals the cause.
+    const errTitle = s.scrape_error ? ` title="${escape(s.scrape_error)}"` : '';
     const cells = [
-      `<td class="muted">${fmtTime(new Date(r.ts).getTime())}</td>`,
-      `<td class="task">${escape(r.task || '—')}</td>`,
-      `<td>${escape(r.model || '—')}</td>`,
-      `<td class="num">${r.tokens_per_second ? r.tokens_per_second.toFixed(1) : '—'}</td>`,
-      `<td class="num">${r.prompt_tokens || '—'}</td>`,
-      `<td class="num">${r.completion_tokens || '—'}</td>`,
-      `<td class="num">${r.prefill_ms ? r.prefill_ms + 'ms' : '—'}</td>`,
-      `<td class="num">${r.total_ms ? r.total_ms + 'ms' : '—'}</td>`,
+      `<td${errTitle}>${hhmmss(new Date(s.ts).getTime())}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? `<span class="error">err</span>` : fmt(pRate, 1)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(gRate, 1)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(s.num_requests_running, 0)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(s.num_requests_waiting, 0)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt((s.gpu_cache_usage_perc||0)*100, 1)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error || ttft == null ? '—' : fmt(ttft*1000, 0)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error || tpot == null ? '—' : fmt(tpot*1000, 1)}</td>`,
     ];
     for (const sp of SPARKS) {
-      const t = r.gpu_temps && r.gpu_temps[sp.name];
-      if (t != null && !isNaN(t)) {
-        tempSums[sp.name] += t; tempCounts[sp.name]++;
-        cells.push(`<td class="num ${tempClass(t)}">${t.toFixed(0)}</td>`);
-      } else {
-        cells.push(`<td class="num muted">—</td>`);
-      }
+      const t = s.gpu_temps ? s.gpu_temps[sp.name] : null;
+      cells.push(`<td class="num ${tempClass(t)}">${t != null ? fmt(t, 0) : '—'}</td>`);
     }
     tr.innerHTML = cells.join('');
-    tbody.appendChild(tr);
-
-    if (r.tokens_per_second > 0) { sumTps += r.tokens_per_second; nTps++; }
+    // Newest row at the top.
+    body.insertBefore(tr, body.firstChild);
   }
 
-  // Footer
-  const avgTps = nTps > 0 ? (sumTps / nTps).toFixed(1) : '—';
-  const footCells = [
-    `<td class="label">AVG</td>`,
-    `<td></td>`,
-    `<td></td>`,
-    `<td class="num">${avgTps}</td>`,
-    `<td></td>`,
-    `<td></td>`,
-    `<td></td>`,
-    `<td></td>`,
-  ];
-  for (const sp of SPARKS) {
-    const n = tempCounts[sp.name];
-    if (n > 0) {
-      const avg = tempSums[sp.name] / n;
-      footCells.push(`<td class="num ${tempClass(avg)}">${avg.toFixed(0)}</td>`);
+  const empty = $('empty');
+  empty.style.display = SAMPLES.length === 0 ? '' : 'none';
+  $('samplesTable').style.display = SAMPLES.length === 0 ? 'none' : '';
+
+  if (latest) {
+    const age = Date.now() - new Date(latest.ts).getTime();
+    $('scrapeAge').textContent = `last scrape ${ageShort(age)}`;
+    if (latest.scrape_error) {
+      $('scrapeAge').classList.add('error');
+      $('scrapeAge').textContent += ` — ${latest.scrape_error}`;
     } else {
-      footCells.push(`<td class="num muted">—</td>`);
+      $('scrapeAge').classList.remove('error');
     }
   }
-  const footRow = document.createElement('tr');
-  footRow.innerHTML = footCells.join('');
-  tfoot.appendChild(footRow);
 }
 
-function escape(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+// --- refresh loop -------------------------------------------------------
 
 async function refresh() {
+  if ($('modalBg').classList.contains('open')) {
+    // Settings modal edits EDIT_SPARKS, but we still don't want to clobber
+    // SPARKS mid-edit in case the user backs out and the table repaints.
+    return;
+  }
   try {
     const cfg = await fetch('/api/config').then(r => r.json());
     SPARKS = cfg.sparks || [];
     UPSTREAM = cfg.upstream_url || '';
-    $('status').textContent = UPSTREAM ? `upstream: ${UPSTREAM}` : 'upstream NOT configured — open Settings';
-    renderThead();
 
-    const data = await fetch('/api/records').then(r => r.json());
-    renderRecords(data.records || []);
+    const data = await fetch('/api/samples').then(r => r.json());
+    SAMPLES = data.samples || [];
+
+    // Pull the model name off the newest sample that saw one. Falling back
+    // across samples handles the first few ticks where /v1/models may not
+    // have been queried yet.
+    let model = '';
+    for (const s of SAMPLES) {
+      if (s.model) { model = s.model; break; }
+    }
+    $('status').textContent = UPSTREAM
+      ? `upstream: ${UPSTREAM}${model ? ` · model: ${model}` : ''}`
+      : 'upstream NOT configured — open Settings';
+
+    renderTiles();
+    renderSamples();
   } catch (e) {
     $('status').textContent = 'connection lost';
   }
 }
 
-// --- settings modal ---
+// --- settings modal -----------------------------------------------------
+
 function openSettings() {
+  EDIT_SPARKS = SPARKS.map(sp => ({...sp}));
+  console.log('[settings] open — seeded EDIT_SPARKS from SPARKS:', EDIT_SPARKS);
   $('upstreamUrl').value = UPSTREAM;
   renderSparkList();
   $('modalBg').classList.add('open');
@@ -295,8 +483,8 @@ function openSettings() {
 function renderSparkList() {
   const list = $('sparkList');
   list.innerHTML = '';
-  for (let i = 0; i < SPARKS.length; i++) {
-    const sp = SPARKS[i];
+  for (let i = 0; i < EDIT_SPARKS.length; i++) {
+    const sp = EDIT_SPARKS[i];
     const row = document.createElement('div');
     row.className = 'spark-row';
     row.innerHTML = `
@@ -313,21 +501,21 @@ function renderSparkList() {
     el.oninput = (e) => {
       const i = +e.target.dataset.i, k = e.target.dataset.k;
       const v = e.target.type === 'number' ? +e.target.value : e.target.value;
-      SPARKS[i][k] = v;
+      EDIT_SPARKS[i][k] = v;
     };
   });
   list.querySelectorAll('button').forEach(el => {
     el.onclick = (e) => {
-      SPARKS.splice(+e.target.dataset.del, 1);
+      EDIT_SPARKS.splice(+e.target.dataset.del, 1);
       renderSparkList();
     };
   });
 }
 
-$('addSparkBtn').onclick = () => {
+function commitStagedSpark() {
   const name = $('newName').value.trim();
-  if (!name) return;
-  SPARKS.push({
+  if (!name) return false;
+  EDIT_SPARKS.push({
     name,
     host: $('newHost').value.trim(),
     user: $('newUser').value.trim() || 'ubuntu',
@@ -335,23 +523,63 @@ $('addSparkBtn').onclick = () => {
     gpu_index: +($('newGPU').value || 0),
     key_path: '',
   });
+  console.log('[settings] committed staged spark; EDIT_SPARKS is now:', EDIT_SPARKS);
   ['newName','newHost','newUser','newPort','newGPU'].forEach(id => $(id).value = '');
-  renderSparkList();
+  return true;
+}
+
+$('addSparkBtn').onclick = () => {
+  if (commitStagedSpark()) renderSparkList();
 };
 
 $('saveBtn').onclick = async () => {
-  const body = { upstream_url: $('upstreamUrl').value.trim(), sparks: SPARKS };
-  const res = await fetch('/api/config', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
-  if (!res.ok) { alert('save failed: '+await res.text()); return; }
-  $('modalBg').classList.remove('open');
-  refresh();
+  if (commitStagedSpark()) renderSparkList();
+  const body = { upstream_url: $('upstreamUrl').value.trim(), sparks: EDIT_SPARKS };
+  console.log('[save] POST /api/config body:', JSON.stringify(body));
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    console.log('[save] response', res.status, text);
+    if (!res.ok) {
+      alert(`save failed (HTTP ${res.status}): ${text || '(empty body)'}`);
+      return;
+    }
+    $('modalBg').classList.remove('open');
+    refresh();
+  } catch (err) {
+    console.error('[save] fetch threw:', err);
+    alert(`save failed (network/fetch error): ${err && err.message ? err.message : err}`);
+  }
 };
 $('cancelBtn').onclick = () => { $('modalBg').classList.remove('open'); refresh(); };
 $('settingsBtn').onclick = openSettings;
 
-// Proxy hint in header
-$('proxyHint').textContent = `proxy: http://${location.hostname}:${+location.port+1 || ''}`;
-$('proxyAddrHint').textContent = `http://${location.hostname}:${+location.port+1 || 7001}`;
+$('clearBtn').onclick = async () => {
+  if (!confirm('Delete all recorded scrape samples? This will empty the Recent Scrapes table and reset all tiles until new scrapes arrive. Upstream URL and spark configuration are NOT affected.')) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/samples', { method: 'DELETE' });
+    if (!res.ok) {
+      alert(`clear failed (HTTP ${res.status}): ${await res.text()}`);
+      return;
+    }
+    // Clear local state immediately so the UI doesn't look stale until the
+    // next poll. The polling loop will re-populate from a fresh scrape within
+    // the scrape interval.
+    SAMPLES = [];
+    $('modalBg').classList.remove('open');
+    renderTiles();
+    renderSamples();
+    refresh();
+  } catch (err) {
+    alert(`clear failed: ${err && err.message ? err.message : err}`);
+  }
+};
 
 refresh();
 setInterval(refresh, 2000);
