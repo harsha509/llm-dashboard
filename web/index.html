@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>LLM Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --hot: #f85149;
+    --warm: #d29922;
+    --cool: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header .status { color: var(--muted); font-size: 12px; }
+  header .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit;
+  }
+  button:hover { background: #30363d; }
+  button.primary { background: #238636; border-color: #2ea043; }
+  button.primary:hover { background: #2ea043; }
+  button.danger { color: var(--hot); }
+
+  .wrap { padding: 16px 20px; }
+  .empty {
+    text-align: center; color: var(--muted); padding: 60px 20px;
+  }
+
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    position: sticky; top: 49px; z-index: 5;
+    background: var(--panel);
+    text-align: left; padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600; font-size: 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  tbody td {
+    padding: 7px 10px;
+    border-bottom: 1px solid rgba(48,54,61,0.4);
+    white-space: nowrap;
+  }
+  tbody tr:hover { background: rgba(88,166,255,0.06); }
+  td.task { white-space: normal; min-width: 200px; max-width: 340px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tfoot td {
+    padding: 10px; font-weight: 700;
+    background: var(--panel);
+    border-top: 2px solid var(--border);
+    position: sticky; bottom: 0;
+  }
+  tfoot td.label { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 12px; }
+
+  .temp-cool { color: var(--cool); }
+  .temp-warm { color: var(--warm); }
+  .temp-hot  { color: var(--hot); font-weight: 700; }
+  .muted { color: var(--muted); }
+
+  /* modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: none; align-items: center; justify-content: center; z-index: 100;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px; width: 640px; max-width: 92vw;
+    max-height: 92vh; overflow: auto;
+  }
+  .modal h2 { margin: 0 0 16px; font-size: 15px; }
+  .modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .modal input {
+    width: 100%; padding: 6px 10px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; font: inherit;
+  }
+  .modal .actions { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+  .spark-row { display: grid; grid-template-columns: 1fr 1.4fr 0.8fr 0.5fr 0.5fr auto; gap: 6px; margin: 6px 0; align-items: center; }
+  .spark-row input { padding: 4px 8px; font-size: 12px; }
+  .spark-row button { padding: 4px 8px; font-size: 12px; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LLM Dashboard</h1>
+  <span class="status" id="status">—</span>
+  <div class="right">
+    <span class="muted" id="proxyHint"></span>
+    <button id="settingsBtn">Settings</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="empty" class="empty">
+    No requests recorded yet. Point your LLM clients at the proxy (see Settings) and start generating.
+  </div>
+  <table id="tbl" style="display:none">
+    <thead>
+      <tr id="thead-row">
+        <th>When</th>
+        <th>Task</th>
+        <th>Model</th>
+        <th class="num">t/s</th>
+        <th class="num">Prompt</th>
+        <th class="num">Out</th>
+        <th class="num">Prefill</th>
+        <th class="num">Total</th>
+        <!-- GPU temp columns injected dynamically -->
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+    <tfoot id="tfoot"></tfoot>
+  </table>
+</div>
+
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h2>Settings</h2>
+    <label>Upstream LLM URL (e.g. your vLLM / LM Studio / llama.cpp server)</label>
+    <input id="upstreamUrl" placeholder="http://localhost:8000" />
+    <div class="hint">Point your LLM clients at <b><span id="proxyAddrHint"></span></b> instead of the upstream.
+      The proxy transparently forwards requests and records metrics.</div>
+
+    <label style="margin-top:18px">DGX Spark nodes (SSH target for nvidia-smi)</label>
+    <div class="spark-row muted" style="font-size:11px">
+      <div>name</div><div>host</div><div>user</div><div>port</div><div>gpu#</div><div></div>
+    </div>
+    <div id="sparkList"></div>
+    <div class="spark-row">
+      <input id="newName" placeholder="spark1" />
+      <input id="newHost" placeholder="10.0.0.10" />
+      <input id="newUser" placeholder="ubuntu" />
+      <input id="newPort" placeholder="22" type="number" />
+      <input id="newGPU" placeholder="0" type="number" />
+      <button id="addSparkBtn">+</button>
+    </div>
+    <div class="hint">Uses <code>~/.ssh/id_ed25519</code> or <code>id_rsa</code> by default. Key-based auth only.</div>
+
+    <div class="actions">
+      <button id="cancelBtn">Cancel</button>
+      <button id="saveBtn" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let SPARKS = [];   // list of known sparks (from last /api/config)
+let UPSTREAM = "";
+
+function tempClass(t) {
+  if (t == null || isNaN(t)) return '';
+  if (t >= 85) return 'temp-hot';
+  if (t >= 70) return 'temp-warm';
+  return 'temp-cool';
+}
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function renderThead() {
+  const row = $('thead-row');
+  // Drop any previously injected temp columns
+  [...row.querySelectorAll('.temp-col')].forEach(n => n.remove());
+  for (const sp of SPARKS) {
+    const th = document.createElement('th');
+    th.className = 'num temp-col';
+    th.textContent = `°C ${sp.name}`;
+    row.appendChild(th);
+  }
+}
+
+function renderRecords(recs) {
+  const tbody = $('tbody');
+  const tfoot = $('tfoot');
+  tbody.innerHTML = '';
+  tfoot.innerHTML = '';
+
+  if (!recs || recs.length === 0) {
+    $('tbl').style.display = 'none';
+    $('empty').style.display = 'block';
+    return;
+  }
+  $('tbl').style.display = '';
+  $('empty').style.display = 'none';
+
+  let sumTps = 0, nTps = 0;
+  const tempSums = {}, tempCounts = {};
+  for (const sp of SPARKS) { tempSums[sp.name] = 0; tempCounts[sp.name] = 0; }
+
+  for (const r of recs) {
+    const tr = document.createElement('tr');
+    const cells = [
+      `<td class="muted">${fmtTime(new Date(r.ts).getTime())}</td>`,
+      `<td class="task">${escape(r.task || '—')}</td>`,
+      `<td>${escape(r.model || '—')}</td>`,
+      `<td class="num">${r.tokens_per_second ? r.tokens_per_second.toFixed(1) : '—'}</td>`,
+      `<td class="num">${r.prompt_tokens || '—'}</td>`,
+      `<td class="num">${r.completion_tokens || '—'}</td>`,
+      `<td class="num">${r.prefill_ms ? r.prefill_ms + 'ms' : '—'}</td>`,
+      `<td class="num">${r.total_ms ? r.total_ms + 'ms' : '—'}</td>`,
+    ];
+    for (const sp of SPARKS) {
+      const t = r.gpu_temps && r.gpu_temps[sp.name];
+      if (t != null && !isNaN(t)) {
+        tempSums[sp.name] += t; tempCounts[sp.name]++;
+        cells.push(`<td class="num ${tempClass(t)}">${t.toFixed(0)}</td>`);
+      } else {
+        cells.push(`<td class="num muted">—</td>`);
+      }
+    }
+    tr.innerHTML = cells.join('');
+    tbody.appendChild(tr);
+
+    if (r.tokens_per_second > 0) { sumTps += r.tokens_per_second; nTps++; }
+  }
+
+  // Footer
+  const avgTps = nTps > 0 ? (sumTps / nTps).toFixed(1) : '—';
+  const footCells = [
+    `<td class="label">AVG</td>`,
+    `<td></td>`,
+    `<td></td>`,
+    `<td class="num">${avgTps}</td>`,
+    `<td></td>`,
+    `<td></td>`,
+    `<td></td>`,
+    `<td></td>`,
+  ];
+  for (const sp of SPARKS) {
+    const n = tempCounts[sp.name];
+    if (n > 0) {
+      const avg = tempSums[sp.name] / n;
+      footCells.push(`<td class="num ${tempClass(avg)}">${avg.toFixed(0)}</td>`);
+    } else {
+      footCells.push(`<td class="num muted">—</td>`);
+    }
+  }
+  const footRow = document.createElement('tr');
+  footRow.innerHTML = footCells.join('');
+  tfoot.appendChild(footRow);
+}
+
+function escape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function refresh() {
+  try {
+    const cfg = await fetch('/api/config').then(r => r.json());
+    SPARKS = cfg.sparks || [];
+    UPSTREAM = cfg.upstream_url || '';
+    $('status').textContent = UPSTREAM ? `upstream: ${UPSTREAM}` : 'upstream NOT configured — open Settings';
+    renderThead();
+
+    const data = await fetch('/api/records').then(r => r.json());
+    renderRecords(data.records || []);
+  } catch (e) {
+    $('status').textContent = 'connection lost';
+  }
+}
+
+// --- settings modal ---
+function openSettings() {
+  $('upstreamUrl').value = UPSTREAM;
+  renderSparkList();
+  $('modalBg').classList.add('open');
+}
+
+function renderSparkList() {
+  const list = $('sparkList');
+  list.innerHTML = '';
+  for (let i = 0; i < SPARKS.length; i++) {
+    const sp = SPARKS[i];
+    const row = document.createElement('div');
+    row.className = 'spark-row';
+    row.innerHTML = `
+      <input value="${escape(sp.name)}" data-i="${i}" data-k="name"/>
+      <input value="${escape(sp.host)}" data-i="${i}" data-k="host"/>
+      <input value="${escape(sp.user)}" data-i="${i}" data-k="user"/>
+      <input value="${sp.port||22}" type="number" data-i="${i}" data-k="port"/>
+      <input value="${sp.gpu_index||0}" type="number" data-i="${i}" data-k="gpu_index"/>
+      <button class="danger" data-del="${i}">×</button>
+    `;
+    list.appendChild(row);
+  }
+  list.querySelectorAll('input').forEach(el => {
+    el.oninput = (e) => {
+      const i = +e.target.dataset.i, k = e.target.dataset.k;
+      const v = e.target.type === 'number' ? +e.target.value : e.target.value;
+      SPARKS[i][k] = v;
+    };
+  });
+  list.querySelectorAll('button').forEach(el => {
+    el.onclick = (e) => {
+      SPARKS.splice(+e.target.dataset.del, 1);
+      renderSparkList();
+    };
+  });
+}
+
+$('addSparkBtn').onclick = () => {
+  const name = $('newName').value.trim();
+  if (!name) return;
+  SPARKS.push({
+    name,
+    host: $('newHost').value.trim(),
+    user: $('newUser').value.trim() || 'ubuntu',
+    port: +($('newPort').value || 22),
+    gpu_index: +($('newGPU').value || 0),
+    key_path: '',
+  });
+  ['newName','newHost','newUser','newPort','newGPU'].forEach(id => $(id).value = '');
+  renderSparkList();
+};
+
+$('saveBtn').onclick = async () => {
+  const body = { upstream_url: $('upstreamUrl').value.trim(), sparks: SPARKS };
+  const res = await fetch('/api/config', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+  if (!res.ok) { alert('save failed: '+await res.text()); return; }
+  $('modalBg').classList.remove('open');
+  refresh();
+};
+$('cancelBtn').onclick = () => { $('modalBg').classList.remove('open'); refresh(); };
+$('settingsBtn').onclick = openSettings;
+
+// Proxy hint in header
+$('proxyHint').textContent = `proxy: http://${location.hostname}:${+location.port+1 || ''}`;
+$('proxyAddrHint').textContent = `http://${location.hostname}:${+location.port+1 || 7001}`;
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
