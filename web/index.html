@@ -55,6 +55,13 @@
     gap: 10px;
     margin-bottom: 16px;
   }
+  .tile-group-label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  .tile-group + .tile-group { margin-top: 8px; }
   .tile {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -152,20 +159,14 @@
 </header>
 
 <div class="wrap" id="wrap">
-  <div id="tiles" class="tiles"></div>
+  <div id="tiles"></div>
 
   <div class="section-header">Recent scrapes</div>
   <table id="samplesTable">
     <thead>
       <tr>
         <th>When</th>
-        <th class="num">Prompt t/s</th>
         <th class="num">Gen t/s</th>
-        <th class="num">Running</th>
-        <th class="num">Waiting</th>
-        <th class="num">KV %</th>
-        <th class="num">TTFT (ms)</th>
-        <th class="num">TPOT (ms)</th>
         <!-- per-spark °C columns are appended here by ensureHeaderHasSparks() -->
       </tr>
     </thead>
@@ -300,6 +301,29 @@ function sessionRate(key) {
   return d / dt;
 }
 
+// peakMoment walks every consecutive pair of good samples and returns the
+// pair with the highest per-tick rate, together with the rate itself. The
+// "latest" field is the sample recorded at the peak — use its gpu_temps
+// to show the temperatures that were actually present at that moment,
+// not whatever is current.
+function peakMoment(key) {
+  const good = SAMPLES.filter(s => !s.scrape_error);
+  if (good.length < 2) return null;
+  let best = null;
+  // SAMPLES is newest-first; walk each newer/older pair.
+  for (let i = 0; i < good.length - 1; i++) {
+    const latest = good[i];
+    const older  = good[i + 1];
+    const dt = (new Date(latest.ts).getTime() - new Date(older.ts).getTime()) / 1000;
+    if (dt <= 0) continue;
+    const d = latest[key] - older[key];
+    if (d < 0) continue; // counter reset
+    const r = d / dt;
+    if (!best || r > best.rate) best = { rate: r, latest, older };
+  }
+  return best;
+}
+
 // --- tiles --------------------------------------------------------------
 
 function renderTiles() {
@@ -310,58 +334,70 @@ function renderTiles() {
     return;
   }
 
-  const promptRate = rate(latest, older, 'prompt_tokens_total', dtSec);
-  const genRate    = rate(latest, older, 'generation_tokens_total', dtSec);
-  const ttftAvg    = avgDelta(latest, older, 'ttft_sum', 'ttft_count');
-  const tpotAvg    = avgDelta(latest, older, 'tpot_sum', 'tpot_count');
-  const e2eAvg     = avgDelta(latest, older, 'e2e_sum', 'e2e_count');
+  // --- NOW: live values ---------------------------------------------------
+  const genRate = rate(latest, older, 'generation_tokens_total', dtSec);
+  const running = latest.num_requests_running || 0;
 
-  // Short-window rates for "right now" feel.
-  // Session-wide rates + cumulative totals for "am I actually seeing data"
-  // — these stay non-zero across idle gaps as long as any traffic has
-  // happened since the dashboard started polling.
-  const genSessionRate    = sessionRate('generation_tokens_total');
-  const promptSessionRate = sessionRate('prompt_tokens_total');
-
-  // Number formatter that keeps large counters readable: 12,345,678.
-  const bignum = (n) => (n == null || isNaN(n)) ? '—' : Math.round(n).toLocaleString();
-
-  const cards = [
-    // --- live / short-window view (last ~30s) --------------------------
-    { label: 'Prompt tok/s',  value: fmt(promptRate, 1), sub: 'last 30s' },
-    { label: 'Gen tok/s',     value: fmt(genRate, 1),    sub: 'last 30s' },
-    { label: 'Running',       value: fmt(latest.num_requests_running, 0) },
-    { label: 'Waiting',       value: fmt(latest.num_requests_waiting, 0) },
-    { label: 'KV cache',      value: fmt((latest.gpu_cache_usage_perc||0)*100, 1), unit: '%' },
-    { label: 'Avg TTFT',      value: fmt(ttftAvg != null ? ttftAvg*1000 : null, 0), unit: 'ms', sub: 'last 30s' },
-    { label: 'Avg TPOT',      value: fmt(tpotAvg != null ? tpotAvg*1000 : null, 1), unit: 'ms', sub: 'last 30s' },
-    { label: 'Avg e2e',       value: fmt(e2eAvg  != null ? e2eAvg*1000  : null, 0), unit: 'ms', sub: 'last 30s' },
-
-    // --- session totals (never go back to 0 once traffic has happened) -
-    { label: 'Session gen t/s',    value: fmt(genSessionRate, 2),    sub: 'since oldest sample' },
-    { label: 'Session prompt t/s', value: fmt(promptSessionRate, 2), sub: 'since oldest sample' },
-    { label: 'Total prompt tok',   value: bignum(latest.prompt_tokens_total) },
-    { label: 'Total gen tok',      value: bignum(latest.generation_tokens_total) },
-    { label: 'Total requests',     value: bignum(latest.e2e_count) },
+  const nowCards = [
+    {
+      label: 'Gen tok/s',
+      value: fmt(genRate, 1),
+      sub: running > 0 ? `${running} request${running > 1 ? 's' : ''} running` : 'idle',
+    },
   ];
-
-  // Per-spark GPU temp tiles
   for (const sp of SPARKS) {
     const t = latest.gpu_temps ? latest.gpu_temps[sp.name] : null;
-    cards.push({
+    nowCards.push({
       label: `${sp.name} °C`,
       value: t != null ? fmt(t, 0) : '—',
       valueClass: tempClass(t),
     });
   }
 
-  tiles.innerHTML = cards.map(c => `
+  // --- PEAK: highest-rate sample + temps captured at that same tick ------
+  // Using the *same* sample's temps means "at the moment of peak throughput,
+  // the GPUs were this hot" — not whatever they are right now.
+  const peak = peakMoment('generation_tokens_total');
+  let peakCards = [];
+  if (peak) {
+    const peakTemps = peak.latest.gpu_temps || {};
+    const peakTime  = hhmmss(new Date(peak.latest.ts).getTime());
+    peakCards.push({
+      label: 'Peak gen tok/s',
+      value: fmt(peak.rate, 1),
+      sub: `at ${peakTime}`,
+    });
+    for (const sp of SPARKS) {
+      const t = peakTemps[sp.name];
+      peakCards.push({
+        label: `${sp.name} °C`,
+        value: t != null ? fmt(t, 0) : '—',
+        valueClass: tempClass(t),
+        sub: `at ${peakTime}`,
+      });
+    }
+  }
+
+  const tileHTML = (c) => `
     <div class="tile">
       <div class="label">${escape(c.label)}</div>
       <div class="value ${c.valueClass||''}">${escape(c.value)}${c.unit ? `<span class="unit">${escape(c.unit)}</span>` : ''}</div>
       ${c.sub ? `<div class="sub">${escape(c.sub)}</div>` : ''}
     </div>
-  `).join('');
+  `;
+
+  tiles.innerHTML = `
+    <div class="tile-group">
+      <div class="tile-group-label">Now</div>
+      <div class="tiles">${nowCards.map(tileHTML).join('')}</div>
+    </div>
+    ${peakCards.length ? `
+    <div class="tile-group">
+      <div class="tile-group-label">Peak</div>
+      <div class="tiles">${peakCards.map(tileHTML).join('')}</div>
+    </div>
+    ` : ''}
+  `;
 }
 
 // --- recent samples table ----------------------------------------------
@@ -392,28 +428,18 @@ function renderSamples() {
     const s = window[i];
     const prev = i > 0 ? window[i - 1] : null;
     const dt = prev ? (new Date(s.ts).getTime() - new Date(prev.ts).getTime()) / 1000 : null;
-    const pRate = prev && dt > 0 ? rate(s, prev, 'prompt_tokens_total', dt) : null;
     const gRate = prev && dt > 0 ? rate(s, prev, 'generation_tokens_total', dt) : null;
-    const ttft  = prev ? avgDelta(s, prev, 'ttft_sum', 'ttft_count') : null;
-    const tpot  = prev ? avgDelta(s, prev, 'tpot_sum', 'tpot_count') : null;
 
     const tr = document.createElement('tr');
-    // If this row is a failed scrape, tag every cell with a title= tooltip
-    // containing the actual error message so hover reveals the cause.
+    // Failed scrapes: hover any cell to see the actual error message.
     const errTitle = s.scrape_error ? ` title="${escape(s.scrape_error)}"` : '';
     const cells = [
       `<td${errTitle}>${hhmmss(new Date(s.ts).getTime())}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error ? `<span class="error">err</span>` : fmt(pRate, 1)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(gRate, 1)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(s.num_requests_running, 0)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt(s.num_requests_waiting, 0)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error ? '' : fmt((s.gpu_cache_usage_perc||0)*100, 1)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error || ttft == null ? '—' : fmt(ttft*1000, 0)}</td>`,
-      `<td class="num"${errTitle}>${s.scrape_error || tpot == null ? '—' : fmt(tpot*1000, 1)}</td>`,
+      `<td class="num"${errTitle}>${s.scrape_error ? `<span class="error">err</span>` : fmt(gRate, 1)}</td>`,
     ];
     for (const sp of SPARKS) {
       const t = s.gpu_temps ? s.gpu_temps[sp.name] : null;
-      cells.push(`<td class="num ${tempClass(t)}">${t != null ? fmt(t, 0) : '—'}</td>`);
+      cells.push(`<td class="num ${tempClass(t)}"${errTitle}>${t != null ? fmt(t, 0) : '—'}</td>`);
     }
     tr.innerHTML = cells.join('');
     // Newest row at the top.
